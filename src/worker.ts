@@ -1,100 +1,194 @@
-import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
-import ffmpegStatic from "ffmpeg-static";
+import ffmpeg from "fluent-ffmpeg";
+import { getConfig, getLadder, type ResolutionRung } from "./config";
 
 const UPLOAD_DIR = path.resolve(process.cwd(), "uploads");
 const OUTPUT_DIR = path.resolve(process.cwd(), "public");
 
-// Only 2 rungs in ladder for better performance
-const LADDER = [
-  { name: "240p", scale: "scale=-2:426", bitrate: "400k" },
-  { name: "720p", scale: "scale=-2:1280", bitrate: "2000k" }
-];
+// Optionally set custom ffmpeg binary (enables system builds with GPU support)
+try {
+  const userSpecified = process.env.FFMPEG_PATH;
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const staticFallback = (() => { try { return require("ffmpeg-static") as string; } catch { return null; } })();
+  const chosen = userSpecified || staticFallback;
+  if (chosen) {
+    ffmpeg.setFfmpegPath(chosen);
+  }
+} catch {}
 
-function runCmd(cmd: string, args: string[], cwd?: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: "inherit", cwd: cwd ?? process.cwd() });
-    p.on("error", (err) => reject(err));
-    p.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} ${args.join(" ")} exited with code ${code}`));
+// Get configuration and resolution ladder
+const CONFIG = getConfig();
+const LADDER = getLadder().filter(rung => rung.enabled);
+
+console.log(`🚀 Starting encoder with config:`, {
+  useGPU: CONFIG.useGPU,
+  preset: CONFIG.preset,
+  maxConcurrentEncodings: CONFIG.maxConcurrentEncodings,
+  enabledResolutions: LADDER.map(r => r.name)
+});
+
+// Semaphore for limiting concurrent encodings
+class Semaphore {
+  private permits: number;
+  private waitQueue: Array<() => void> = [];
+
+  constructor(permits: number) {
+    this.permits = permits;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.permits > 0) {
+      this.permits--;
+      return Promise.resolve();
+    }
+    
+    return new Promise<void>((resolve) => {
+      this.waitQueue.push(resolve);
     });
-  });
+  }
+
+  release(): void {
+    if (this.waitQueue.length > 0) {
+      const resolve = this.waitQueue.shift()!;
+      resolve();
+    } else {
+      this.permits++;
+    }
+  }
 }
 
-async function encodeBaseline(inputPath: string, workDir: string): Promise<string[]> {
-  console.log("Starting parallel encoding for all resolutions...");
+const encodingSemaphore = new Semaphore(CONFIG.maxConcurrentEncodings);
+
+async function encodeResolution(
+  rung: ResolutionRung,
+  inputPath: string,
+  workDir: string
+): Promise<string> {
+  const outFile = path.join(workDir, `${rung.name}.mp4`);
   
-  // Create encoding promises for all resolutions simultaneously
-  const encodingPromises = LADDER.map(async (rung) => {
-    const outFile = path.join(workDir, `${rung.name}.mp4`);
-    const args = [
-      "-y",
-      "-i", inputPath,
-      "-vf", rung.scale,
-      "-c:v", "h264_videotoolbox", // change to h264_nvenc for NVidia GPU
-      "-preset", "fast",
-      "-b:v", rung.bitrate,
-      "-profile:v", "high",
-      "-keyint_min", "48", "-g", "48", "-sc_threshold", "0",
-      "-c:a", "aac",
-      "-b:a", "128k",
-      "-movflags", "faststart",
-      outFile
-    ];
-    console.log(`Encoding ${path.basename(outFile)} ...`);
-    await runCmd(ffmpegStatic!, args);
-    console.log(`Completed ${path.basename(outFile)}`);
-    return outFile;
-  });
-
-  // Wait for all encoding processes to complete simultaneously
-  const outputs = await Promise.all(encodingPromises);
-  console.log("All parallel encoding completed!");
-  return outputs;
+  // Acquire semaphore permit before starting encoding
+  await encodingSemaphore.acquire();
+  
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      console.log(`🎬 Encoding ${rung.name} for ${path.basename(inputPath)} ...`);
+      
+      let command = ffmpeg(inputPath)
+        .videoCodec('libx264')
+        .videoFilters(rung.scale)
+        .videoBitrate(rung.bitrate)
+        .outputOptions([
+          '-profile:v', 'high',
+          '-g', CONFIG.keyframeInterval.toString(),
+          '-keyint_min', CONFIG.keyframeInterval.toString(),
+          '-sc_threshold', '0',
+          '-bf', CONFIG.bframes.toString(),
+          '-refs', CONFIG.refFrames.toString(),
+          '-preset', CONFIG.preset,
+          '-tune', CONFIG.tune,
+          '-crf', rung.crf.toString(),
+          '-threads', CONFIG.cpuThreads.toString(),
+          '-max_muxing_queue_size', '1024',
+          '-bufsize', CONFIG.bufferSize
+        ])
+        .audioCodec('aac')
+        .audioBitrate('128k');
+      
+      // Add fast start flag if enabled
+      if (CONFIG.enableFastStart) {
+        command = command.outputOptions(['-movflags', 'faststart']);
+      }
+      
+      // Try to use GPU acceleration if available and enabled
+      if (CONFIG.useGPU) {
+        // Check for NVIDIA GPU support
+        try {
+          command = command.videoCodec('h264_nvenc');
+          console.log(`🚀 Using NVIDIA GPU acceleration for ${rung.name}`);
+        } catch (e) {
+          // Try Intel Quick Sync
+          try {
+            command = command.videoCodec('h264_qsv');
+            console.log(`🚀 Using Intel Quick Sync for ${rung.name}`);
+          } catch (e2) {
+            // Fallback to CPU encoding
+            console.log(`💻 Using CPU encoding for ${rung.name}`);
+          }
+        }
+      } else {
+        console.log(`💻 Using CPU encoding for ${rung.name}`);
+      }
+      
+      command
+        .output(outFile)
+        .on('progress', (progress) => {
+          if (progress.percent) {
+            console.log(`📊 ${rung.name}: ${progress.percent.toFixed(1)}% complete`);
+          }
+        })
+        .on('end', () => {
+          console.log(`✅ Finished ${rung.name} for ${path.basename(inputPath)}`);
+          resolve(outFile);
+        })
+        .on('error', (err) => {
+          console.error(`❌ Error encoding ${rung.name}:`, err);
+          reject(err);
+        })
+        .run();
+    });
+  } finally {
+    // Always release the semaphore permit
+    encodingSemaphore.release();
+  }
 }
 
-async function generateCmafAndManifests(outputs: string[], manifestDir: string) {
+async function generateCmafAndManifest(outputs: string[], manifestDir: string) {
+  console.log("📦 Generating DASH/HLS manifests...");
   fs.mkdirSync(manifestDir, { recursive: true });
 
-  // DASH
-  const dashArgs = [
-    "-dash", "4000",
-    "-rap",
-    "-frag-rap",
-    "-profile", "dashavc264:live",
-    "-out", path.join(manifestDir, "manifest.mpd")
-  ];
-  for (const f of outputs) {
-    dashArgs.push(`${f}#video`);
-    dashArgs.push(`${f}#audio`);
+  // For now, we'll use the existing MP4Box approach since fluent-ffmpeg doesn't directly support DASH/HLS manifest generation
+  // You could also consider using other packages like @ffmpeg-installer/ffmpeg with spawn for manifest generation
+  const { spawn } = require("child_process");
+  const manifestMode = (process.env.MANIFESTS || "both").toLowerCase(); // both | dash | hls | none
+  
+  if (manifestMode === "both" || manifestMode === "dash") {
+    const dashArgs = [
+      "-dash", "4000", "-rap", "-frag-rap",
+      "-profile", "dashavc264:live",
+      "-out", path.join(manifestDir, "manifest.mpd"),
+      ...outputs.flatMap(f => [`${f}#video`, `${f}#audio`])
+    ];
+    await new Promise<void>((resolve, reject) => {
+      const p = spawn("MP4Box", dashArgs, { stdio: "inherit" });
+      p.on("error", reject);
+      p.on("close", (code: number) => {
+        if (code === 0) resolve();
+        else reject(new Error(`MP4Box exited with code ${code}`));
+      });
+    });
   }
-  console.log("Generating DASH with MP4Box...");
-  await runCmd("MP4Box", dashArgs);
 
-  // HLS
-  const hlsArgs = [
-    "-dash", "4000",
-    "-rap",
-    "-frag-rap",
-    "-profile", "live",
-    "-out", path.join(manifestDir, "manifest.m3u8")
-  ];
-  for (const f of outputs) {
-    hlsArgs.push(`${f}#video`);
-    hlsArgs.push(`${f}#audio`);
+  if (manifestMode === "both" || manifestMode === "hls") {
+    const hlsArgs = [
+      "-dash", "4000", "-rap", "-frag-rap",
+      "-profile", "live",
+      "-out", path.join(manifestDir, "manifest.m3u8"),
+      ...outputs.flatMap(f => [`${f}#video`, `${f}#audio`])
+    ];
+    await new Promise<void>((resolve, reject) => {
+      const p = spawn("MP4Box", hlsArgs, { stdio: "inherit" });
+      p.on("error", reject);
+      p.on("close", (code: number) => {
+        if (code === 0) resolve();
+        else reject(new Error(`MP4Box exited with code ${code}`));
+      });
+    });
   }
-  console.log("Generating HLS with MP4Box...");
-  await runCmd("MP4Box", hlsArgs);
 
-  // Delete original progressive MP4s (keep only CMAF fMP4 segments + manifests)
+  // Clean up the intermediate MP4s
   for (const f of outputs) {
-    try {
-      fs.unlinkSync(f);
-    } catch (e) {
-      console.warn(`Could not delete ${f}`, e);
-    }
+    try { fs.unlinkSync(f); } catch {}
   }
 }
 
@@ -103,46 +197,80 @@ async function processUploadsOnce() {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
   const files = fs.readdirSync(UPLOAD_DIR).filter(f => f.toLowerCase().endsWith(".mp4"));
-  for (const file of files) {
+
+  await Promise.all(files.map(async (file) => {
     const id = path.parse(file).name;
     const workDir = path.join(OUTPUT_DIR, id);
+    const manifestPath = path.join(workDir, "manifest.mpd");
+    const lockPath = path.join(workDir, ".processing.lock");
 
-    if (fs.existsSync(path.join(workDir, "manifest.mpd"))) {
-      console.log(`Skipping ${file} (already processed)`);
-      continue;
+    if (fs.existsSync(manifestPath)) {
+      console.log(`⏭️ Skipping ${file} (already processed)`);
+      return;
     }
 
     fs.mkdirSync(workDir, { recursive: true });
+    // Cross-process lock to avoid duplicate work when multiple workers run
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+    } catch (err: any) {
+      if (err && err.code === "EEXIST") {
+        console.log(`🔒 Skipping ${file} (another worker is processing)`);
+        return;
+      }
+      throw err;
+    }
     const inputPath = path.join(UPLOAD_DIR, file);
 
     try {
-      console.log(`Processing ${file} -> ${workDir}`);
+      console.log(`🚀 Processing ${file}`);
       const tStart = Date.now();
-      const outputs = await encodeBaseline(inputPath, workDir);
+
+      // Encode both resolutions in parallel with better error handling
+      const outputs = await Promise.allSettled(
+        LADDER.map(rung => encodeResolution(rung, inputPath, workDir))
+      );
+
+      // Check if any encoding failed
+      const failedEncodings = outputs.filter(result => result.status === 'rejected');
+      if (failedEncodings.length > 0) {
+        console.error(`❌ ${failedEncodings.length} encoding(s) failed for ${file}`);
+        failedEncodings.forEach((result, index) => {
+          if (result.status === 'rejected') {
+            console.error(`  - ${LADDER[index].name}: ${result.reason}`);
+          }
+        });
+        return;
+      }
+
+      const successfulOutputs = outputs.map(result => 
+        result.status === 'fulfilled' ? result.value : null
+      ).filter(Boolean) as string[];
+
       const tAfterEncode = Date.now();
-      await generateCmafAndManifests(outputs, workDir);
+
+      // Generate manifests once
+      await generateCmafAndManifest(successfulOutputs, workDir);
       const tAfterSegment = Date.now();
 
       const encodingSeconds = ((tAfterEncode - tStart) / 1000).toFixed(2);
       const segmentationSeconds = ((tAfterSegment - tAfterEncode) / 1000).toFixed(2);
       const totalSeconds = ((tAfterSegment - tStart) / 1000).toFixed(2);
 
-      console.log(`Timing: encoding=${encodingSeconds}s, segmentation=${segmentationSeconds}s, total=${totalSeconds}s`);
-      console.log(`Completed processing ${file}`);
+      console.log(`⏱ Timing: encoding=${encodingSeconds}s, segmentation=${segmentationSeconds}s, total=${totalSeconds}s`);
+      console.log(`✅ Finished ${file} in ${totalSeconds}s`);
     } catch (err) {
-      console.error(`Error processing ${file}:`, err);
+      console.error(`❌ Error processing ${file}:`, err);
+    } finally {
+      try { fs.unlinkSync(lockPath); } catch {}
     }
-  }
+  }));
 }
 
 async function loop() {
   while (true) {
-    try {
-      await processUploadsOnce();
-    } catch (err) {
-      console.error("Worker error:", err);
-    }
-    await new Promise((r) => setTimeout(r, 4000));
+    await processUploadsOnce();
+    await new Promise(r => setTimeout(r, 4000));
   }
 }
 
