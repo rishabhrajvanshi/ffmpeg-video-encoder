@@ -43,7 +43,7 @@ export const DEFAULT_CONFIG: EncodingConfig = {
   enableFastStart: true,  // Enable fast start for web streaming
   
   // Advanced settings
-  keyframeInterval: 48,   // Keyframe interval
+  keyframeInterval: 120,  // Keyframe interval (4 seconds at 30fps)
   bframes: 1,             // Number of B-frames (reduced for speed)
   refFrames: 1,           // Number of reference frames (reduced for speed)
 };
@@ -121,14 +121,14 @@ export function getConfig(): EncodingConfig {
     return {
       ...DEFAULT_CONFIG,
       useGPU: envUseGpu ?? false,  // Disable GPU in development to avoid conflicts
-      maxConcurrentEncodings: envMaxConcurrency ?? 1,
+      maxConcurrentEncodings: envMaxConcurrency ?? 4, // Allow parallel processing in development
       preset: envPreset ?? 'ultrafast',  // Fastest encoding for development
       tune: envTune ?? 'zerolatency',  // Optimize for speed
       crf: envCrf ?? 30,  // Highest CRF for fastest encoding
       cpuThreads: envCpuThreads ?? DEFAULT_CONFIG.cpuThreads,
       bframes: 0,  // Disable B-frames for maximum speed
       refFrames: 1,  // Minimum reference frames
-      keyframeInterval: 60  // Larger keyframe interval for speed
+      keyframeInterval: 120  // 4 second segments (at 30fps)
     };
   }
   

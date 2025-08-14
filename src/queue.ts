@@ -1,19 +1,33 @@
-import { Queue } from "bullmq";
+import { Queue, Job } from "bullmq";
 import IORedis from "ioredis";
-import path from "path";
 
-const connection = new IORedis();
-const videoQueue = new Queue("video-processing", { connection });
+// Create Redis connection with required BullMQ options
+const connection = new IORedis({
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false
+});
 
-// Example: enqueue all files in uploads folder
-import fs from "fs";
-const UPLOAD_DIR = path.resolve(process.cwd(), "uploads");
+// Create video processing queue
+export const videoQueue = new Queue("video-processing", { connection });
 
-(async () => {
-  const files = fs.readdirSync(UPLOAD_DIR).filter(f => f.endsWith(".mp4"));
-  for (const file of files) {
-    await videoQueue.add("process", { file });
-    console.log(`📥 Enqueued ${file}`);
+// Export job status types
+export type JobStatus = "waiting" | "active" | "completed" | "failed";
+
+// Get job status
+export async function getJobStatus(jobId: string): Promise<{ status: JobStatus; progress?: number }> {
+  const job = await videoQueue.getJob(jobId);
+  if (!job) {
+    throw new Error("Job not found");
   }
-  process.exit(0);
-})();
+  
+  return {
+    status: job.status as JobStatus,
+    progress: job.progress as number | undefined
+  };
+}
+
+// Add a new video processing job
+export async function addVideoJob(filename: string): Promise<string> {
+  const job = await videoQueue.add("process", { filename });
+  return job.id!;
+}
