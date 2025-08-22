@@ -35,4 +35,5 @@ export interface VideoProcessingMessage {
   filename: string;
   uploadId: string;
   timestamp: number;
+  hasAudio: boolean;
 }

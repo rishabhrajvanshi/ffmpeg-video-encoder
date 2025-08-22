@@ -120,7 +120,8 @@ app.post("/upload", upload.array("video"), async (req, res) => {
           s3Key,
           filename: file.originalname,
           uploadId,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          hasAudio: false,
         };
 
         // Send message to SQS

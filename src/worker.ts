@@ -67,6 +67,45 @@ class Semaphore {
 
 const encodingSemaphore = new Semaphore(CONFIG.maxConcurrentEncodings);
 
+async function extractAudio(
+  s3Response: any,
+  message: VideoProcessingMessage,
+  workDir: string
+): Promise<string> {
+  const outFile = path.join(workDir, 'audio.mp3');
+  
+  // Create a temporary input file for more reliable processing
+  const tempInputPath = path.join(workDir, '_input.mp4');
+  const writeStream = fs.createWriteStream(tempInputPath);
+  await new Promise<void>((resolveWrite, rejectWrite) => {
+    (s3Response.Body as Readable)
+      .pipe(writeStream)
+      .on('finish', resolveWrite)
+      .on('error', rejectWrite);
+  });
+
+  console.log(`🎵 Extracting audio from ${message.filename} ...`);
+  
+  return await new Promise<string>((resolve, reject) => {
+    ffmpeg(tempInputPath)
+      .toFormat('mp3')
+      .audioCodec('libmp3lame')
+      .audioBitrate('192k')
+      .output(outFile)
+      .on('end', () => {
+        // Clean up temporary input file
+        try { fs.unlinkSync(tempInputPath); } catch {}
+        console.log(`✅ Finished audio extraction for ${message.filename}`);
+        resolve(outFile);
+      })
+      .on('error', (err) => {
+        console.error(`❌ Error extracting audio:`, err);
+        reject(err);
+      })
+      .run();
+  });
+}
+
 async function encodeResolution(
   rung: ResolutionRung,
   s3Response: any,
@@ -223,13 +262,22 @@ async function processVideo(message: VideoProcessingMessage) {
     console.log(`🚀 Processing ${message.filename}`);
     const tStart = Date.now();
 
-    // Encode all resolutions in parallel with better error handling
-    const outputs = await Promise.allSettled(
-      LADDER.map(rung => encodeResolution(rung, s3Response, message, workDir))
-    );
+    // Extract audio and encode all resolutions in parallel with better error handling
+    const [audioResult, ...encodingResults] = await Promise.allSettled([
+      message.hasAudio ? extractAudio(s3Response, message, workDir) : null,
+      ...LADDER.map(rung => encodeResolution(rung, s3Response, message, workDir))
+    ]);
+
+    // Check if audio extraction failed
+    if (audioResult.status === 'rejected') {
+      console.error(`❌ Audio extraction failed for ${message.filename}:`, audioResult.reason);
+      throw new Error("Audio extraction failed");
+    }
+
+    const audioFile = audioResult.status === 'fulfilled' ? audioResult.value : null;
 
     // Check if any encoding failed
-    const failedEncodings = outputs.filter(result => result.status === 'rejected');
+    const failedEncodings = encodingResults.filter(result => result.status === 'rejected');
     if (failedEncodings.length > 0) {
       console.error(`❌ ${failedEncodings.length} encoding(s) failed for ${message.filename}`);
       failedEncodings.forEach((result, index) => {
@@ -240,7 +288,7 @@ async function processVideo(message: VideoProcessingMessage) {
       throw new Error("Some encodings failed");
     }
 
-    const successfulOutputs = outputs.map(result => 
+    const successfulOutputs = encodingResults.map(result => 
       result.status === 'fulfilled' ? result.value : null
     ).filter(Boolean) as string[];
 
@@ -266,6 +314,7 @@ async function processVideo(message: VideoProcessingMessage) {
             : file.endsWith('.m3u8') ? 'application/x-mpegURL'
             : file.endsWith('.m4s') ? 'video/iso.segment'
             : file.endsWith('.mp4') ? 'video/mp4'
+            : file.endsWith('.mp3') ? 'audio/mpeg'
             : 'application/octet-stream';
 
           await s3Client.send(new PutObjectCommand({
