@@ -10,7 +10,6 @@ interface Sound {
 
 export async function createSound(sound: Sound): Promise<types.Uuid> {
   const id = types.Uuid.random();
-  console.log(sound);
   const query = 'INSERT INTO sound (id, name, user_id, url, thumbnail) VALUES (:id, :name, :userId, :url, :thumbnail)';
   
   // Prepare parameters with proper type conversion and explicit typing
