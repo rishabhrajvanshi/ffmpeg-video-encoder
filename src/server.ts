@@ -3,15 +3,14 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { v4 as uuidv4 } from "uuid";
-import { PutObjectCommand, HeadObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { SendMessageCommand } from "@aws-sdk/client-sqs";
 import { s3Client, sqsClient, S3_BUCKET, S3_INPUT_PREFIX, S3_OUTPUT_PREFIX, SQS_QUEUE_URL } from "./aws-config";
-import { Readable } from "stream";
 import type { VideoProcessingMessage } from "./aws-config";
 
 const UPLOAD_DIR = path.resolve(process.cwd(), "uploads");
 const PUBLIC_DIR = path.resolve(process.cwd(), "public");
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 4000;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(PUBLIC_DIR, { recursive: true });
@@ -122,6 +121,8 @@ app.post("/upload", upload.array("video"), async (req, res) => {
           uploadId,
           timestamp: Date.now(),
           hasAudio: false,
+          userId: req.body.userId,
+          postId: req.body.postId
         };
 
         // Send message to SQS

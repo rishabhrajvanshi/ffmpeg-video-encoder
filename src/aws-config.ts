@@ -32,8 +32,10 @@ export const sqsClient = new SQSClient(awsConfig);
 // Message types
 export interface VideoProcessingMessage {
   s3Key: string;
+  postId: string;
   filename: string;
   uploadId: string;
   timestamp: number;
   hasAudio: boolean;
+  userId: string;
 }
